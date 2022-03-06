@@ -24,8 +24,10 @@ public:
     int currVal = analogRead(Pin);
 
     if (mode == m_lastMode) {
-      bool changed = (currVal != m_vals[mode]);
-      m_vals[mode] = currVal;
+      bool changed = abs(currVal - m_vals[mode]) > 5;
+      if (changed) {
+        m_vals[mode] = currVal;
+      }
       return changed;
     }
 

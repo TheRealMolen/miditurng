@@ -53,6 +53,10 @@ enum class ScaleFamily : byte {
 
   Count,
 };
+inline ScaleFamily nextFamily(ScaleFamily fam) {
+  fam = (byte(fam) < byte(ScaleFamily::Count)) ? ScaleFamily(byte(fam) + 1) : ScaleFamily(0);
+  return fam;
+}
 
 enum class EepAddr {
   Channel = 200,    // skip the first block of eeprom as it's likely the most tired
@@ -64,27 +68,24 @@ enum class EepAddr {
   ScaleVariantEU,
   ScaleVariantDisc,
   NumOctaves,
-  StartOctave,
+  BaseOctave,
   Chance,
   RatchetChance,
   RatchetIntensity,
 };
 
 
-static const uint32_t Colours12[] = {
-  0x404060,
-  0x884422,
-  0xff0000,
-  0xee9900,
-  0xdddd00,
-  0x00ff00,
-  0x0000ff,
-  0xdd00dd,
-  0x9999aa,
-  0x99ffbb,
-  0xff9988,
-  0xffffff,
+static constexpr uint32_t Colours[] = {
+  0xdd0000,
+  0xe89000,
+  0xddd000,
+  0x50ee50,
+  0x5050ee,
+  0x9900dd,
+  0xdd99ff, // "ultraviolet"
+  0xffffff, // "white"
 };
+static constexpr byte NumColours = sizeof(Colours) / sizeof(Colours[0]);
 
 
 byte pot2Range(int potVar, byte maxVal) {   // returns [0,maxVal] inclusive
@@ -110,14 +111,32 @@ void setBpm(byte newBpm) {
 Adafruit_NeoPixel uiPixel(1, PIN_UIPIXEL, NEO_GRB + NEO_KHZ800);
 uint32_t uiOverrideCol = uiPixel.Color(0xff, 0xff, 0xff);
 uint16_t uiOverrideMsRemaining = 0;
+
+static constexpr uint16_t uiOverrideTimeMs = 300;
+static constexpr uint16_t uiFlashOverrideTimeMs = 500;
+static constexpr uint16_t uiFlashOffTimeStartMs = 400;
+
 uint16_t uiLastMs = 0;
 
 
-void overrideUiCol(uint32_t col, bool force=true) {
+void overrideUiCol(uint32_t col, bool flash, bool force) {
   if (uiOverrideMsRemaining == 0 || force) {
-    uiOverrideMsRemaining = 300;
+    uiOverrideMsRemaining = flash ? uiFlashOverrideTimeMs : uiOverrideTimeMs;
     uiOverrideCol = col;
   }
+}
+
+void feedbackValue(byte val) {
+  uint32_t col;
+  bool flash = false;
+  if (val >= NumColours) {
+    flash = true;
+    val -= NumColours;
+  }
+
+  col = (val < NumColours) ? Colours[val] : 0xff00ff;
+
+  overrideUiCol(col, flash, true);
 }
 
 
@@ -168,16 +187,17 @@ void forgetNoteOn(byte note) {
     }
   }
 }
+bool ledState = false;
 void midiSend(const struct MidiNote* note, bool noteOn) {
   if (noteOn) {
     MIDI.sendNoteOn(note->note, note->vel, sendChannel);
     rememberNoteOn(note->note);
-    digitalWrite(13, HIGH);
+    ledState = !ledState;
+    digitalWrite(13, ledState);
   }
   else {
     MIDI.sendNoteOff(note->note, 0, sendChannel);
     forgetNoteOn(note->note);
-    digitalWrite(13, LOW);
   }
 }
 void midiClearAllNotes() {
@@ -185,7 +205,6 @@ void midiClearAllNotes() {
     MIDI.sendNoteOff(playingNotes[i], 0, sendChannel);
   }
   numPlayingNotes = 0;
-  digitalWrite(13, LOW);
 }
 
 
@@ -208,7 +227,6 @@ void updateScaleWestern(byte mode) {
   }
   
   scaleWesternMode = mode;
-  EEPROM.write(int(EepAddr::ScaleVariantEU), mode);
 }
 
 byte scalePentaMaj[] = { 0, 2, 4, 7, 9 };
@@ -228,7 +246,6 @@ void updateScaleJ5(byte num) {
   scaleJ5[4] = 8 + hi;
 
   scaleJ5Num = num;
-  EEPROM.write(int(EepAddr::ScaleVariantJP), num);
 }
 
 byte scaleWhole[] = { 0, 2, 4, 6, 8, 10 };
@@ -280,61 +297,32 @@ void updateScale(ScaleFamily fam) {
   }
 }
 
-//void nextScaleVariant() {
-//  switch (scaleFamily) {
-//    case ScaleFamily::Japanese:
-//      updateScaleJ5((scaleJ5Num + 1) & 0xf);
-//      overrideUiCol(Colours12[(scaleJ5Num / 2) + 2]);
-//      break;
-//      
-//    case ScaleFamily::Penta:
-//      scalePentaVar = (scalePentaVar < 2) ? scalePentaVar + 1 : 0;
-//      EEPROM.write(int(EepAddr::ScaleVariantPent), scalePentaVar);
-//      overrideUiCol(Colours12[scalePentaVar + 2]);
-//      break;
-//      
-//    case ScaleFamily::Western:
-//      updateScaleWestern((scaleWesternMode < 6) ? scaleWesternMode + 1 : 0);
-//      overrideUiCol(Colours12[scaleWesternMode + 2]);
-//      break;
-//      
-//    case ScaleFamily::Discordant:
-//      scaleDiscordVar = (scaleDiscordVar < 1) ? scaleDiscordVar + 1 : 0;
-//      EEPROM.write(int(EepAddr::ScaleVariantDisc), scaleDiscordVar);
-//      overrideUiCol(Colours12[scaleDiscordVar + 2]);
-//      break;
-//
-//    case ScaleFamily::Count: break;
-//  }
-//
-//  // this copies the scale into the scale buffer
-//  updateScale(scaleFamily);
-//}
-
 void updateScaleVariant() {
   int potVal = pot.getVal(UIMode_Pot_Variant);
   
   switch (scaleFamily) {
     case ScaleFamily::Japanese:
       updateScaleJ5(pot2Range(potVal, 15));
-      overrideUiCol(Colours12[(scaleJ5Num & 0x7) + 2]);
+      EEPROM.write(int(EepAddr::ScaleVariantJP), scaleJ5Num);
+      feedbackValue(scaleJ5Num);
       break;
       
     case ScaleFamily::Penta:
       scalePentaVar = pot2Range(potVal, 2);
       EEPROM.write(int(EepAddr::ScaleVariantPent), scalePentaVar);
-      overrideUiCol(Colours12[scalePentaVar + 2]);
+      feedbackValue(scalePentaVar);
       break;
       
     case ScaleFamily::Western:
       updateScaleWestern(pot2Range(potVal, 6));
-      overrideUiCol(Colours12[scaleWesternMode + 2]);
+      EEPROM.write(int(EepAddr::ScaleVariantEU), scaleWesternMode);
+      feedbackValue(scaleWesternMode);
       break;
       
     case ScaleFamily::Discordant:
       scaleDiscordVar = pot2Range(potVal, 1);
       EEPROM.write(int(EepAddr::ScaleVariantDisc), scaleDiscordVar);
-      overrideUiCol(Colours12[scaleDiscordVar + 2]);
+      feedbackValue(scaleDiscordVar);
       break;
 
     case ScaleFamily::Count: break;
@@ -345,13 +333,6 @@ void updateScaleVariant() {
 }
 
 
-static const int RootNote = 36;
-int numOctaves = 3;
-
-unsigned long lastTimeUs = 0;
-unsigned long tickProgressUs = 0;
-
-
 
 //                                   _   _             
 //    __ _  ___ _ __   ___ _ __ __ _| |_(_) ___  _ __  
@@ -360,20 +341,62 @@ unsigned long tickProgressUs = 0;
 //   \__, |\___|_| |_|\___|_|  \__,_|\__|_|\___/|_| |_|
 //   |___/                                             
 //  
+static constexpr byte NumNotesInOctave = 12;
+static constexpr byte MaxOctaves = 4;
+static constexpr byte MinBaseOctave = 1;
+static constexpr byte MaxBaseOctave = 7;
+
+constexpr byte calcMinNote(byte k, byte o) {
+  return (k + (o * NumNotesInOctave));
+}
+constexpr byte calcMaxNote(byte _minNote, byte nO) {
+  return (_minNote + ((nO + 1) * NumNotesInOctave));
+}
+
+byte key = 0;
+byte baseOctave = 3;
+byte numOctaves = 2;
+
+byte minNote = calcMinNote(key, baseOctave);
+byte maxNote = calcMaxNote(minNote, numOctaves);
+
+unsigned long lastTimeUs = 0;
+unsigned long tickProgressUs = 0;
+
+bool rand50() {
+  return (byte(random()) < 0x80u);
+}
+
+void setKey(byte newKey) {
+  if (newKey == key)
+    return;
+
+  key = newKey;
+  minNote = calcMinNote(key, baseOctave);
+  maxNote = calcMaxNote(minNote, numOctaves);
+}
+void setBaseOctave(byte newOctave) {
+  if (newOctave == baseOctave)
+    return;
+
+  baseOctave = newOctave;
+  minNote = calcMinNote(key, baseOctave);
+  maxNote = calcMaxNote(minNote, numOctaves);
+}
 
 void generateNewNote(MidiNote* note, bool init = false) {
+  
+  byte newNote = minNote;
+  newNote += scale[random(scaleSize)];
+
   if (init) {
     note->oct = random(0, numOctaves);
   }
-  
-  byte newNote = RootNote;
-  newNote += scale[random(scaleSize)];
-
-  if (random(2) > 0) {
-    if ((random(100) > 50 || note->oct < 1) && (note->oct < (numOctaves-1))) {
+  else if (rand50()) {
+    if ((rand50() || note->oct == 0) && ((note->oct + 1) < numOctaves)) {
       note->oct += 1;
     }
-    else {
+    else if (note->oct > 0) {
       note->oct -= 1;
     }
   }
@@ -419,7 +442,7 @@ void updatePlayback() {
     // generate a new note if we rolled enough dice
     int threshold = pot.getVal(UIMode_Default);
     if (random(0, 1000) > threshold) {
-      overrideUiCol(0xddaaaa, false);
+      overrideUiCol(0xddaaaa, false, false);
       generateNewNote(&noteBuf[nextNote]);
     }
   }
@@ -444,22 +467,34 @@ void uiDefaultModeAction(uint8_t action) {
       setBpm(BpmChoices[bpmChoice]);
       EEPROM.write(int(EepAddr::BpmChoice), bpmChoice);
       static_assert(NumBpmChoices <= 12);
-      overrideUiCol(Colours12[bpmChoice]);
+      feedbackValue(bpmChoice);
       break;
 
     case Btn_Chnl:
       ++numOctaves;
-      if (numOctaves > 4)
-        numOctaves = 1;        
+      if (numOctaves >= MaxOctaves)
+        numOctaves = 0;        
       EEPROM.write(int(EepAddr::NumOctaves), numOctaves);
-      overrideUiCol(Colours12[numOctaves + 4]);
+      feedbackValue(numOctaves);
       regenPattern();
       break;
 
     case Btn_Play:
-      ScaleFamily newFam = (byte(scaleFamily) < byte(ScaleFamily::Count) - 1) ? ScaleFamily(byte(scaleFamily) + 1) : ScaleFamily::Japanese;
+      ScaleFamily newFam = nextFamily(scaleFamily);
       updateScale(newFam);
-      overrideUiCol(Colours12[byte(scaleFamily) + 2]);
+      feedbackValue(byte(newFam));
+      regenPattern();
+      break;
+  }
+}
+
+void uiPlayModeAction(uint8_t action) {
+  switch (action) {
+    case Btn_Chnl:
+      byte newBaseOctave = (baseOctave < (MaxBaseOctave - 1)) ? baseOctave + 1 : MinBaseOctave;
+      setBaseOctave(newBaseOctave);
+      EEPROM.write(int(EepAddr::BaseOctave), baseOctave);
+      feedbackValue(baseOctave);
       regenPattern();
       break;
   }
@@ -470,7 +505,7 @@ void uiAction(uint8_t action, uint8_t mode) {
     case UIMode_Default:      uiDefaultModeAction(action); break;
     case UIMode_Thru:         break;
     case UIMode_Chnl:         break;
-    case UIMode_Play:         break;
+    case UIMode_Play:         uiPlayModeAction(action); ;
     case UIMode_ThruChnl:     break;
     case UIMode_ThruPlay:     break;
     case UIMode_ChnlPlay:     break;
@@ -488,7 +523,7 @@ void applyPotValue(int val, uint8_t mode) {
     case UIMode_ThruChnlPlay:
       sendChannel = map(val, 0, 1023, 0, 15);
       EEPROM.write(int(EepAddr::Channel), sendChannel);
-      overrideUiCol(Colours12[sendChannel & 7]);
+      feedbackValue(sendChannel);
       break;
   }
 }
@@ -582,7 +617,12 @@ void updateUI(bool force = false) {
   if (uiChanged) {
     uint32_t colour = 0xeeddaa;
     if (uiOverrideMsRemaining > 0){
-      colour = uiOverrideCol; 
+      if (uiOverrideMsRemaining < uiOverrideTimeMs || uiOverrideMsRemaining > uiFlashOffTimeStartMs) {
+        colour = uiOverrideCol; 
+      }
+      else {
+        colour = 0x000000;
+      }
     }
     
     uiPixel.setPixelColor(0, uiPixel.gamma32(colour));
@@ -611,8 +651,6 @@ void loadSettings() {
   }
   setBpm(BpmChoices[bpmChoice]);
 
-  // TODO: Key
-
   byte scaleFam;
   EEPROM.get(int(EepAddr::ScaleFamily), scaleFam);
   if (scaleFam >= byte(ScaleFamily::Count)) {
@@ -620,23 +658,25 @@ void loadSettings() {
   }
   scaleFamily = ScaleFamily(scaleFam);
 
-  byte variant;
-  EEPROM.get(int(EepAddr::ScaleVariantJP), variant);
-  updateScaleJ5((variant < 16) ? variant : 0);
-  EEPROM.get(int(EepAddr::ScaleVariantPent), variant);
-  scalePentaVar = (variant < 3) ? variant : 0;
-  EEPROM.get(int(EepAddr::ScaleVariantEU), variant);
-  updateScaleWestern((variant < 7) ? variant : 0);
-  EEPROM.get(int(EepAddr::ScaleVariantDisc), variant);
-  scaleDiscordVar = (variant < 2) ? variant : 0;
+  byte val;
+  EEPROM.get(int(EepAddr::ScaleVariantJP), val);
+  updateScaleJ5((val < 16) ? val : 0);
+  EEPROM.get(int(EepAddr::ScaleVariantPent), val);
+  scalePentaVar = (val < 3) ? val : 0;
+  EEPROM.get(int(EepAddr::ScaleVariantEU), val);
+  updateScaleWestern((val < 7) ? val : 0);
+  EEPROM.get(int(EepAddr::ScaleVariantDisc), val);
+  scaleDiscordVar = (val < 2) ? val : 0;
 
   updateScale(scaleFamily);
 
   EEPROM.get(int(EepAddr::NumOctaves), numOctaves);
-  numOctaves = (numOctaves < 5 && numOctaves > 0) ? numOctaves : 2;
+  numOctaves = (numOctaves < 5) ? numOctaves : 2;
+  EEPROM.get(int(EepAddr::BaseOctave), val);
+  val = (val < MaxBaseOctave) ? val : 3;
+  setBaseOctave(baseOctave);
 
   //TODO:
-//  StartOctave,
 //  Chance,
 //  RatchetChance,
 //  RatchetIntensity,
@@ -662,6 +702,9 @@ void setup() {
   randomSeed(analogRead(3) + analogRead(4) + analogRead(5));
 
   regenPattern();
+
+  // ensure we instantly play the first note
+  tickProgressUs = usPerQn + 1;
 
   updateUI(true);
 }
