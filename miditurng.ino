@@ -1,3 +1,20 @@
+/*
+ * Midi "Turing Machine" Sequence Generator
+ * 
+ * 
+ * Controls:
+ * <mode>   x       PLAY      CHNL      THRU     PC       CT       PCT
+ *    
+ *    POT  mutate   sc.var     key      divn     tie%     len      chnl
+ *         
+ *  t [o]  BPM                            -
+ *  c [o]  #octs    st.oct      -
+ *    
+ *  p [o]  sc.fam      -
+ *    
+ */
+
+
 #include <EEPROM.h>
 
 #include <Adafruit_NeoPixel.h>
@@ -5,6 +22,9 @@
 
 #include "DebouncedInput.h"
 #include "ModalPot.h"
+
+#define array_size(arr) (sizeof(arr) / sizeof(arr[0]))
+
 
 #define PIN_UIPIXEL       9
 #define PIN_BTN_THRU      10
@@ -17,6 +37,7 @@ enum Btn {
   Btn_Play,
 };
 
+
 using ThruBtn = DebouncedInput<PIN_BTN_THRU, Btn_Thru>;
 using ChnlBtn = DebouncedInput<PIN_BTN_CHANNEL, Btn_Chnl>;
 using PlayBtn = DebouncedInput<PIN_BTN_REC, Btn_Play>;
@@ -25,6 +46,7 @@ ThruBtn thruButton;
 ChnlBtn channelButton;
 PlayBtn recButton;
 ModalPot pot;
+
 
 enum UIMode {
   UIMode_Default = 0,
@@ -38,27 +60,9 @@ enum UIMode {
   UIMode_ChnlPlay = ChnlBtn::Flag | PlayBtn::Flag,
   
   UIMode_ThruChnlPlay = ThruBtn::Flag | ChnlBtn::Flag | PlayBtn::Flag,
-
-  UIMode_Pot_Variant = UIMode_Play,
 };
 
-
-MIDI_CREATE_DEFAULT_INSTANCE();
-
-enum class ScaleFamily : byte {
-  Japanese,
-  Penta,
-  Western,
-  Discordant,
-
-  Count,
-};
-inline ScaleFamily nextFamily(ScaleFamily fam) {
-  fam = (byte(fam) < byte(ScaleFamily::Count)) ? ScaleFamily(byte(fam) + 1) : ScaleFamily(0);
-  return fam;
-}
-
-enum class EepAddr {
+enum class EepAddr : int {
   Channel = 200,    // skip the first block of eeprom as it's likely the most tired
   BpmChoice,
   Key,              // 0-11 C-B
@@ -69,11 +73,21 @@ enum class EepAddr {
   ScaleVariantDisc,
   NumOctaves,
   BaseOctave,
+  TimeDivision,
+  SeqLength,
   Chance,
   RatchetChance,
   RatchetIntensity,
 };
 
+enum class ScaleFamily : byte {
+  Japanese,
+  Penta,
+  Western,
+  Discordant,
+
+  Count,
+};
 
 static constexpr uint32_t Colours[] = {
   0xdd0000,
@@ -85,7 +99,7 @@ static constexpr uint32_t Colours[] = {
   0xdd99ff, // "ultraviolet"
   0xffffff, // "white"
 };
-static constexpr byte NumColours = sizeof(Colours) / sizeof(Colours[0]);
+static constexpr byte NumColours = array_size(Colours);
 
 
 byte pot2Range(int potVar, byte maxVal) {   // returns [0,maxVal] inclusive
@@ -96,15 +110,44 @@ byte pot2Range(int potVar, byte maxVal) {   // returns [0,maxVal] inclusive
 }
 
 
-static constexpr uint8_t BpmChoices[] = { 4, 8, 15, 25, 40, 60, 80, 100, 120, 140, 160, 200 };
-static constexpr uint8_t NumBpmChoices = (sizeof(BpmChoices) / sizeof(BpmChoices[0]));
+static constexpr uint8_t BpmChoices[] = { 60, 70, 80, 90, 100, 120, 140 };
+static constexpr uint8_t NumBpmChoices = array_size(BpmChoices);
 
-byte bpmChoice = 8;
+static constexpr uint8_t DivisionNums[] = { 4, 2, 1, 2, 3, 1,  3, 1,  3,  1,  1 };
+static constexpr uint8_t DivisionDems[] = { 1, 1, 1, 4, 8, 4, 16, 8, 32, 16, 32 };
+static_assert(array_size(DivisionNums) == array_size(DivisionDems));
+static constexpr uint8_t NumDivisionChoices =  array_size(DivisionNums);
+
+byte bpmChoice = 2;
+byte divisionChoice = 2;
+
 byte bpm;
-uint32_t usPerQn = 100;
-void setBpm(byte newBpm) {
-  bpm = newBpm;
-  usPerQn = (((unsigned long)1000000 * 60) / newBpm);
+uint32_t usPerNote = 100;
+uint32_t usPerMidiClock = 4;    // MIDI clock runs at 24 ticks per quarter note
+uint32_t noteProgressUs = 0x80000000;
+uint32_t midiClockProgressUs = 0x80000000;
+
+
+void updateTempo() {
+  const uint32_t usPerBar = (((unsigned long)1000000 * 60 * 4) / bpm);
+
+  if (divisionChoice >= NumDivisionChoices) {
+    divisionChoice = NumDivisionChoices - 1;
+  }
+
+  const uint32_t usPerDivision = usPerBar * DivisionNums[divisionChoice];
+  usPerNote = usPerDivision / DivisionDems[divisionChoice];
+
+  usPerMidiClock = usPerBar / 4;
+  usPerMidiClock = usPerMidiClock / 24;
+
+  // set the next notes to happen immediately
+  if (noteProgressUs > usPerNote) {
+    noteProgressUs = usPerNote;
+  }
+  if (midiClockProgressUs > usPerMidiClock) {
+    midiClockProgressUs = usPerMidiClock;
+  }
 }
 
 
@@ -112,16 +155,21 @@ Adafruit_NeoPixel uiPixel(1, PIN_UIPIXEL, NEO_GRB + NEO_KHZ800);
 uint32_t uiOverrideCol = uiPixel.Color(0xff, 0xff, 0xff);
 uint16_t uiOverrideMsRemaining = 0;
 
-static constexpr uint16_t uiOverrideTimeMs = 300;
-static constexpr uint16_t uiFlashOverrideTimeMs = 500;
-static constexpr uint16_t uiFlashOffTimeStartMs = 400;
+static constexpr uint16_t uiOverrideTimeMs = 400;
+static constexpr uint16_t uiFlashOverrideTimeMs = 650;
+static constexpr uint16_t uiFlashOffTimeStartMs = 500;
 
 uint16_t uiLastMs = 0;
+uint32_t lastTimeUs = 0;
 
 
 void overrideUiCol(uint32_t col, bool flash, bool force) {
   if (uiOverrideMsRemaining == 0 || force) {
     uiOverrideMsRemaining = flash ? uiFlashOverrideTimeMs : uiOverrideTimeMs;
+    if (!force && !flash) {
+      uiOverrideMsRemaining -= 100;
+    }
+    
     uiOverrideCol = col;
   }
 }
@@ -139,6 +187,16 @@ void feedbackValue(byte val) {
   overrideUiCol(col, flash, true);
 }
 
+void feedbackContinuous(int val, int maxVal) {
+  static const uint32_t MaxHue = 65535;
+  uint32_t hue = val;
+  hue *= MaxHue;
+  hue /= maxVal;
+
+  uint32_t col = uiPixel.ColorHSV(hue);
+  overrideUiCol(col, false, true);
+}
+
 
 
 //               _       _   _ 
@@ -147,6 +205,7 @@ void feedbackValue(byte val) {
 //  | | | | | | | | | (_| | | |
 //  |_| |_| |_| |_|  \__,_| |_|
 //                             
+MIDI_CREATE_DEFAULT_INSTANCE();
 byte sendChannel = 2;
 
 struct MidiNote
@@ -154,9 +213,10 @@ struct MidiNote
   byte note;
   byte oct;
   byte vel;
+  byte tie : 1;
 };
 static const byte MaxNotes = 16;
-static const byte numNotes = MaxNotes;
+byte numNotes = MaxNotes;
 
 MidiNote noteBuf[MaxNotes];
 byte nextNote = 0;
@@ -187,6 +247,7 @@ void forgetNoteOn(byte note) {
     }
   }
 }
+
 bool ledState = false;
 void midiSend(const struct MidiNote* note, bool noteOn) {
   if (noteOn) {
@@ -207,6 +268,10 @@ void midiClearAllNotes() {
   numPlayingNotes = 0;
 }
 
+void midiSendClock() {
+  MIDI.sendClock();
+}
+
 
 
 //                 _           
@@ -215,6 +280,11 @@ void midiClearAllNotes() {
 //  \__ \ (_| (_| | |  __/\__ \      .  
 //  |___/\___\__,_|_|\___||___/  
 //                             
+
+inline ScaleFamily nextFamily(ScaleFamily fam) {
+  fam = (byte(fam)+1 < byte(ScaleFamily::Count)) ? ScaleFamily(byte(fam) + 1) : ScaleFamily(0);
+  return fam;
+}
 
 static const byte WesternSpaces[] = { 2, 2, 1, 2, 2, 2, 1, 2, 2, 1, 2, 2, 2 };
 byte scaleWestern[7]{};
@@ -298,7 +368,7 @@ void updateScale(ScaleFamily fam) {
 }
 
 void updateScaleVariant() {
-  int potVal = pot.getVal(UIMode_Pot_Variant);
+  int potVal = pot.getVal(UIMode_Play);
   
   switch (scaleFamily) {
     case ScaleFamily::Japanese:
@@ -356,29 +426,21 @@ constexpr byte calcMaxNote(byte _minNote, byte nO) {
 byte key = 0;
 byte baseOctave = 3;
 byte numOctaves = 2;
+byte tieChance = 0;
 
 byte minNote = calcMinNote(key, baseOctave);
 byte maxNote = calcMaxNote(minNote, numOctaves);
-
-unsigned long lastTimeUs = 0;
-unsigned long tickProgressUs = 0;
 
 bool rand50() {
   return (byte(random()) < 0x80u);
 }
 
 void setKey(byte newKey) {
-  if (newKey == key)
-    return;
-
   key = newKey;
   minNote = calcMinNote(key, baseOctave);
   maxNote = calcMaxNote(minNote, numOctaves);
 }
 void setBaseOctave(byte newOctave) {
-  if (newOctave == baseOctave)
-    return;
-
   baseOctave = newOctave;
   minNote = calcMinNote(key, baseOctave);
   maxNote = calcMaxNote(minNote, numOctaves);
@@ -406,6 +468,13 @@ void generateNewNote(MidiNote* note, bool init = false) {
   note->note = newNote;
 
   note->vel = random(100, 127);
+
+  if (note != &noteBuf[0]) {
+    note->tie = (random(256) < tieChance);
+  }
+  else {
+    note->tie = false;
+  }
 }
 
 void regenPattern() {
@@ -423,16 +492,21 @@ void regenPattern() {
 //  | .__/|_|\__,_|\__, |_.__/ \__,_|\___|_|\_\                      .
 //  |_|            |___/                       
 
-void updatePlayback() {
-  unsigned long now = micros();
-  unsigned long deltaUs = now - lastTimeUs;
-  lastTimeUs = now;
-  tickProgressUs += deltaUs;
-  while (tickProgressUs > usPerQn) {
-    tickProgressUs -= usPerQn;
+void updatePlayback(uint32_t deltaUs) {
+  noteProgressUs += deltaUs;
+  
+  while (noteProgressUs > usPerNote) {
+    noteProgressUs -= usPerNote;
 
-    midiClearAllNotes();
-    midiSend(&noteBuf[nextNote], true);
+    auto& note = noteBuf[nextNote];
+
+    if (!note.tie) {
+      midiClearAllNotes();
+      midiSend(&note, true);
+    }
+    else {
+      overrideUiCol(0xaaaadd, false, false);
+    }
       
     ++nextNote;
     if (nextNote >= numNotes) {
@@ -443,8 +517,17 @@ void updatePlayback() {
     int threshold = pot.getVal(UIMode_Default);
     if (random(0, 1000) > threshold) {
       overrideUiCol(0xddaaaa, false, false);
-      generateNewNote(&noteBuf[nextNote]);
+      generateNewNote(&note);
     }
+  }
+}
+
+void updateClock(uint32_t deltaUs) {
+  midiClockProgressUs += deltaUs;
+
+  while (midiClockProgressUs > usPerMidiClock) {
+    midiClockProgressUs -= usPerMidiClock;
+    midiSendClock();
   }
 }
 
@@ -463,10 +546,10 @@ void uiDefaultModeAction(uint8_t action) {
       ++bpmChoice;
       if (bpmChoice >= NumBpmChoices)
         bpmChoice = 0;
-        
-      setBpm(BpmChoices[bpmChoice]);
+
+      bpm = BpmChoices[bpmChoice];
+      updateTempo();
       EEPROM.write(int(EepAddr::BpmChoice), bpmChoice);
-      static_assert(NumBpmChoices <= 12);
       feedbackValue(bpmChoice);
       break;
 
@@ -513,17 +596,53 @@ void uiAction(uint8_t action, uint8_t mode) {
   }
 }
 
+bool updateContinuousValue(int val, byte& oldVal, byte maxValExclusive, EepAddr addr) {
+  byte newVal = pot2Range(val, maxValExclusive);
+  
+  if (newVal != oldVal) {
+    oldVal = newVal;
+    EEPROM.write(int(addr), newVal);
+    if (maxValExclusive <= 16) {
+      feedbackValue(newVal);
+    }
+    else {
+      feedbackContinuous(newVal, maxValExclusive);
+    }
+    return true;
+  }
+  return false;
+}
+
 void applyPotValue(int val, uint8_t mode) {
   switch (mode) {
-    case UIMode_Pot_Variant:
+    case UIMode_Thru:
+      if (updateContinuousValue(val, divisionChoice, NumDivisionChoices, EepAddr::TimeDivision)) {
+        updateTempo();
+      }
+      break;
+
+    case UIMode_Chnl:
+      if (updateContinuousValue(val, key, 12, EepAddr::Key)) {
+        setKey(key);
+        regenPattern();
+      }
+      break;
+      
+    case UIMode_Play:
       updateScaleVariant();
       regenPattern();
       break;
+
+    case UIMode_ThruChnl:
+      updateContinuousValue(val, numNotes, MaxNotes, EepAddr::SeqLength);
+      break;
+
+    case UIMode_ChnlPlay:
+      updateContinuousValue(val, tieChance, 255, EepAddr::Chance);
+      break;
     
     case UIMode_ThruChnlPlay:
-      sendChannel = map(val, 0, 1023, 0, 15);
-      EEPROM.write(int(EepAddr::Channel), sendChannel);
-      feedbackValue(sendChannel);
+      updateContinuousValue(val, sendChannel, 16, EepAddr::Channel);
       break;
   }
 }
@@ -645,12 +764,23 @@ void loadSettings() {
     sendChannel = 0;
   }
 
+  // TIME SIGNATURE
   EEPROM.get(int(EepAddr::BpmChoice), bpmChoice);
   if (bpmChoice >= NumBpmChoices) {
-    bpmChoice = 8;
+    bpmChoice = 3;
   }
-  setBpm(BpmChoices[bpmChoice]);
+  bpm = BpmChoices[bpmChoice];
+  EEPROM.get(int(EepAddr::TimeDivision), divisionChoice);
+  if (divisionChoice >= NumDivisionChoices) {
+    divisionChoice = 2;
+  }
+  updateTempo();
 
+  // SCALE
+  EEPROM.get(int(EepAddr::Key), key);
+  if (key >= 12) {
+    key = 0;
+  }
   byte scaleFam;
   EEPROM.get(int(EepAddr::ScaleFamily), scaleFam);
   if (scaleFam >= byte(ScaleFamily::Count)) {
@@ -675,6 +805,11 @@ void loadSettings() {
   EEPROM.get(int(EepAddr::BaseOctave), val);
   val = (val < MaxBaseOctave) ? val : 3;
   setBaseOctave(baseOctave);
+
+  EEPROM.get(int(EepAddr::SeqLength), numNotes);
+  numNotes = (numNotes < MaxNotes) ? numNotes : MaxNotes;
+
+  EEPROM.get(int(EepAddr::Chance), tieChance);
 
   //TODO:
 //  Chance,
@@ -704,9 +839,12 @@ void setup() {
   regenPattern();
 
   // ensure we instantly play the first note
-  tickProgressUs = usPerQn + 1;
+  noteProgressUs = usPerNote + 1;
+  midiClockProgressUs = usPerMidiClock + 1;
 
   updateUI(true);
+
+  MIDI.sendStart();
 }
 
 
@@ -715,5 +853,10 @@ void loop() {
   
   updateUI();
 
-  updatePlayback();
+  uint32_t now = micros();
+  uint32_t deltaUs = now - lastTimeUs;
+  lastTimeUs = now;
+  
+  updatePlayback(deltaUs);
+  updateClock(deltaUs);
 }
