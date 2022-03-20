@@ -14,11 +14,19 @@
  *    
  */
 
+#define D_FAKEMIDIx
 
 #include <EEPROM.h>
 
 #include <Adafruit_NeoPixel.h>
+
+#ifndef D_FAKEMIDI
 #include <MIDI.h>
+#define DbgLog(msg)  do{} while(0)
+#else
+#include "FakeMidi.h"
+#define DbgLog(msg)  Serial.print(msg)
+#endif
 
 #include "DebouncedInput.h"
 #include "ModalPot.h"
@@ -470,7 +478,11 @@ void generateNewNote(MidiNote* note, bool init = false) {
   note->vel = random(100, 127);
 
   if (note != &noteBuf[0]) {
-    note->tie = (random(256) < tieChance);
+    byte roll = random(250);
+    note->tie = (roll < tieChance);
+    
+    DbgLog("  - tie "); DbgLog(note->tie ? "Y" : "n");
+    DbgLog("   rolled "); DbgLog(roll); DbgLog("  vs  "); DbgLog(tieChance); DbgLog("\n");
   }
   else {
     note->tie = false;
@@ -478,9 +490,15 @@ void generateNewNote(MidiNote* note, bool init = false) {
 }
 
 void regenPattern() {
-  for (byte i=0; i<MaxNotes; ++i)
-  {
+  for (byte i=0; i<MaxNotes; ++i) {
     generateNewNote(&noteBuf[i], true);
+  }
+}
+
+void regenTies() {
+  for (byte i=1; i<MaxNotes; ++i) {
+    byte roll = random(250);
+    noteBuf[i].tie = (roll < tieChance);
   }
 }
 
@@ -500,12 +518,10 @@ void updatePlayback(uint32_t deltaUs) {
 
     auto& note = noteBuf[nextNote];
 
-    if (!note.tie) {
+    bool tied = note.tie;
+    if (!tied) {
       midiClearAllNotes();
       midiSend(&note, true);
-    }
-    else {
-      overrideUiCol(0xaaaadd, false, false);
     }
       
     ++nextNote;
@@ -515,9 +531,14 @@ void updatePlayback(uint32_t deltaUs) {
     
     // generate a new note if we rolled enough dice
     int threshold = pot.getVal(UIMode_Default);
-    if (random(0, 1000) > threshold) {
+    int roll = random(1000);
+    DbgLog("regen? "); DbgLog(roll); DbgLog("  vs  "); DbgLog(pot.getVal(UIMode_Default)); DbgLog("\n");
+    if (roll > threshold) {
       overrideUiCol(0xddaaaa, false, false);
       generateNewNote(&note);
+    }
+    else if (tied) {
+      overrideUiCol(0xaaaadd, false, false);
     }
   }
 }
@@ -638,7 +659,9 @@ void applyPotValue(int val, uint8_t mode) {
       break;
 
     case UIMode_ChnlPlay:
-      updateContinuousValue(val, tieChance, 255, EepAddr::Chance);
+      if (updateContinuousValue(val, tieChance, 250, EepAddr::Chance)) {
+        regenTies();
+      }
       break;
     
     case UIMode_ThruChnlPlay:
@@ -810,9 +833,10 @@ void loadSettings() {
   numNotes = (numNotes < MaxNotes) ? numNotes : MaxNotes;
 
   EEPROM.get(int(EepAddr::Chance), tieChance);
+  if (tieChance == 255)
+    tieChance = 0;
 
   //TODO:
-//  Chance,
 //  RatchetChance,
 //  RatchetIntensity,
 }

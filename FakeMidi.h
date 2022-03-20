@@ -1,22 +1,22 @@
 #pragma once
 
-//#include <MIDI.h>
+#define MIDI_CHANNEL_OMNI 16
 
 class FakeMidi
 {
 public:
-  void begin(int channel) {
+  void begin([[maybe_unused]] int channel) {
     Serial.begin(115200);
     Serial.println("FakeMIDI engage....");
   }
   
-  void sendNoteOn(byte note, byte velocity, byte channel) {
+  void sendNoteOn(byte note, [[maybe_unused]] byte velocity, byte channel) {
     Serial.print("ON  ");
     Serial.print((int)note);
     Serial.print(" @ c");
     Serial.println((int)channel);
   }
-  void sendNoteOff(byte note, byte velocity, byte channel) {
+  void sendNoteOff(byte note, [[maybe_unused]] byte velocity, byte channel) {
     Serial.print("OFF ");
     Serial.print((int)note);
     Serial.print(" @ c");
@@ -39,14 +39,6 @@ public:
     return true;
   }
 
-  midi::MidiType getType() {
-    if (cmd == 'p')
-      return midi::NoteOn;
-    if (cmd == 'o')
-      return midi::NoteOff;
-    return midi::PitchBend;
-  }
-
   byte getData1() {
     return 0x3a + (note - 'a');
   }
@@ -55,7 +47,11 @@ public:
   }  
  
   void turnThruOff() {}
+  void sendClock() {}
+  void sendStart() {}
   
 };
 
-FakeMidi MIDI;
+
+
+#define MIDI_CREATE_DEFAULT_INSTANCE()  FakeMidi MIDI
