@@ -196,7 +196,7 @@ void feedbackValue(byte val) {
 }
 
 void feedbackContinuous(int val, int maxVal) {
-  static const uint32_t MaxHue = 65535;
+  static const uint32_t MaxHue = 54600;   // purpley
   uint32_t hue = val;
   hue *= MaxHue;
   hue /= maxVal;
